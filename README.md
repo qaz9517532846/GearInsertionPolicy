@@ -1,0 +1,775 @@
+# Gear Insertion Policy
+
+**English version (this page) | [繁體中文](README.md)**
+
+This project is a **standalone, editable copy** of Isaac Lab's official tutorial
+[Training a Gear Insertion Policy and ROS Deployment](https://isaac-sim.github.io/IsaacLab/release/3.0.0/source/policy_deployment/02_gear_assembly/gear_assembly_policy.html):
+the Manager-Based RL environment (scene, observations, rewards, terminations, events,
+dual-robot configs, RSL-RL PPO agent configs) originally buried inside IsaacLab's
+built-in `isaaclab_tasks` has been moved into this folder, trained with plain
+`python` commands, and extended with a **ROS2 AI-model validation environment**
+that uses Isaac Sim as a stand-in robot — so the exported policy can be exercised
+over a real ROS2 message loop before it ever touches real hardware. All physics/
+training parameters are kept exactly as NVIDIA validated them on real UR10e /
+Flexiv Rizon 4s hardware.
+
+> This project has been run end-to-end on real GPU hardware (RTX 5070 Ti): one
+> full training run (800 iterations, ~19.4 hours) and one full ROS2 validation
+> loop. Results below in [Training Results](#training-results).
+
+---
+
+## Table of Contents
+
+1. [Project Structure](#project-structure)
+2. [Training Results](#training-results)
+3. [Requirements](#requirements)
+4. [Quick Start (Training SOP)](#quick-start-training-sop)
+5. [model.pt → policy.pt Export SOP](#modelpt--policypt-export-sop)
+6. [Configurable Training Parameters](#configurable-training-parameters)
+7. [The Three Sim-to-Real Consistency Principles](#the-three-sim-to-real-consistency-principles)
+8. [Code Architecture](#code-architecture)
+9. [Registered Gym Tasks](#registered-gym-tasks)
+10. [ROS2 AI-Model Validation (Isaac Sim as the Simulated Robot)](#ros2-ai-model-validation-isaac-sim-as-the-simulated-robot)
+11. [Swapping the Robot Arm](#swapping-the-robot-arm)
+12. [Swapping the Manipulated Object](#swapping-the-manipulated-object)
+13. [Troubleshooting](#troubleshooting)
+14. [Known Limitations & Verification Log](#known-limitations--verification-log)
+15. [References](#references)
+
+---
+
+## Project Structure
+
+```
+GearInsertionPolicy/
+├── README.md / README.en.md
+├── scripts/                               # Every python entry point (train/play/ROS2 bridge)
+│   ├── train.py                           # Training entry point (replaces isaaclab.sh train)
+│   ├── play.py                            # Playback/eval entry point (replaces isaaclab.sh play)
+│   └── ros2_isaac_sim_bridge.py           # Isaac Sim side of the ROS2 bridge (needs GPU/Kit, run with python)
+├── train/                                 # Training: environment definitions + results
+│   ├── gear_insertion_policy/             # Importable Python package (the task implementation)
+│   │   ├── __init__.py
+│   │   └── tasks/
+│   │       ├── __init__.py                # imports both config sub-packages -> triggers gym.register()
+│   │       ├── gear_assembly_env_cfg.py   # Robot-agnostic shared base (scene/obs/reward/termination skeleton)
+│   │       ├── mdp/                       # Task-specific MDP library
+│   │       │   ├── observations.py        #   gear_shaft_pos_w / gear_pos_w ...
+│   │       │   ├── rewards.py             #   keypoint_entity_error(_exp) / keypoint_ee_grasp_error(_exp)
+│   │       │   ├── terminations.py        #   reset_when_gear_dropped / *_orientation_exceeds_threshold
+│   │       │   ├── events.py              #   randomize_gear_type / randomize_gears_and_base_pose / set_robot_to_grasp_pose
+│   │       │   └── noise_models.py        #   ResetSampledConstantNoiseModel(Cfg) / *Quaternion*
+│   │       └── config/
+│   │           ├── ur_10e/                # UR10e (6 DOF) + Robotiq 2F-140 / 2F-85
+│   │           └── rizon_4s/              # Flexiv Rizon 4s (7 DOF) + Grav gripper
+│   └── result/                            # TensorBoard exports + video from the completed training run
+│       ├── clip_0000.mp4                  # Video clip recorded during training
+│       ├── Train-mean_reward*.png         # Reward curves
+│       ├── Episode_Termination-*.png      # Episode-end reason breakdown
+│       ├── Episode_Reward-*.png           # Per-reward-term breakdown
+│       ├── Loss-*.png                     # PPO training diagnostics
+│       └── Perf-*.png / Policy-*.png      # Training throughput / action std
+└── valid/                                 # Validation: ROS2 AI-model validation
+    └── ros2_validation_cpp/               # ROS2 ament_cmake package: gear_insertion_ros2_cpp (rclcpp + LibTorch)
+        ├── package.xml / CMakeLists.txt
+        ├── include/gear_insertion_ros2_cpp/tiny_json.hpp
+        ├── src/policy_inference_node.cpp  # The "AI model" side: runs the TorchScript policy via torch::jit::load
+        ├── src/success_monitor_node.cpp   # Automated validation: tallies per-episode success/failure, writes a report
+        └── launch/gear_insertion_validation_cpp.launch.py
+```
+
+`logs/` (checkpoints / TensorBoard events / videos, auto-generated by training,
+excluded via `.gitignore`) is recreated under `GearInsertionPolicy/logs/`
+(relative to the working directory you run the command from) whenever you run
+`scripts/train.py`. `train/result/` is a hand-curated snapshot of a completed
+run's results — the two serve different purposes, don't conflate them.
+
+## Training Results
+
+UR10e + Robotiq 2F-140 (task `GearInsertion-UR10e-2F140-ROSInference-v0`) has
+been trained to completion: **800/800 iterations, ~19.4 hours** (RTX 5070 Ti).
+Final metrics (TensorBoard smoothed / raw value, iteration 799):
+
+| Metric | Smoothed | Raw | Notes |
+|---|---|---|---|
+| `Train/mean_reward` | 3.06 | 3.39 | Starts at 0, climbs quickly for the first ~150 iterations, then keeps rising slowly to convergence — a healthy learning-curve shape |
+| `Episode_Termination/time_out` | 0.71 | 0.68 | Climbs to its plateau around iteration 100, then stays flat — the fraction of episodes that neither dropped the gear nor over-rotated it |
+
+Full curves and a training video clip are in [train/result/](train/result/):
+
+- `Train-mean_reward.png` / `Train-mean_reward-time.png`: reward vs. iteration/time
+- `Episode_Termination-time_out.png` / `-gear_dropped.png` / `-gear_orientation_exceeded.png`: fraction of each episode-end cause
+- `Episode_Reward-end_effector_gear_keypoint_tracking*.png`: reward terms related to insertion precision
+- `Loss-value.png` / `Loss-surrogate.png` / `Loss-entropy.png` / `Loss-learning_rate.png`: PPO training diagnostics
+- `Perf-*.png`: steps/sec, collection time, learning time
+- `Policy-mean_std.png`: action standard deviation (exploration level)
+- `clip_0000.mp4`: a video clip recorded during training
+
+**Important caveat**: a high `time_out` fraction only means "the gear didn't get
+dropped and didn't over-rotate" — it does **not** mean the gear actually reached
+the shaft. That's exactly why the `ros2_isaac_sim_bridge.py` script in the
+"ROS2 AI-Model Validation" section below additionally checks the real
+gear-to-shaft distance before calling an episode a success (see "Code
+Architecture" there). This training run's checkpoints are ready to be exercised
+with `scripts/play.py` or plugged into the ROS2 validation loop.
+
+## Requirements
+
+This project is **not** a standalone install separate from Isaac Lab — it
+imports `isaaclab`, `isaaclab_assets`, `isaaclab_tasks`, `isaaclab_rl`,
+`isaaclab_physx`, etc., so it must be run with a **Python interpreter that has
+Isaac Lab installed**, e.g.:
+
+```bash
+source /path/to/your/isaaclab-arena/.venv/bin/activate
+```
+
+Every `python` command below refers to that interpreter. `scripts/train.py` /
+`scripts/play.py` / `scripts/ros2_isaac_sim_bridge.py` all automatically add
+`GearInsertionPolicy/train/` to `sys.path`, so this project does not need to be
+`pip install`ed.
+
+The ROS2 validation part (`valid/ros2_validation_cpp/`) additionally needs:
+ROS2 (Jazzy was used for local validation), LibTorch (the C++ distribution of
+PyTorch, with `share/cmake/Torch`), `cmake`/`g++`.
+
+## Quick Start (Training SOP)
+
+### Step 1: Small-Scale Visual Sanity Check
+
+```bash
+cd GearInsertionPolicy
+
+python scripts/train.py \
+    --rl_library rsl_rl \
+    --task GearInsertion-UR10e-2F140-ROSInference-v0 \
+    --num_envs 4 \
+    --visualizer kit
+```
+
+Opens the Isaac Sim viewer; you should see several arms holding gears and
+moving around somewhat randomly (insertion won't succeed yet — that's
+expected). Once the scene, physics, and grasp poses look reasonable, `Ctrl+C`
+and move on.
+
+### Step 2: Headless Full-Scale Training + Periodic Video Recording
+
+```bash
+python scripts/train.py \
+    --rl_library rsl_rl \
+    --task GearInsertion-UR10e-2F140-ROSInference-v0 \
+    --num_envs 256 \
+    --video --video_length 200 --video_interval 76800
+```
+
+Omitting `--visualizer` means headless (this Isaac Lab version no longer has a
+`--headless` flag — see the next section). A full training run takes roughly
+12–24 hours; this project's own UR10e run took ~19.4 hours (see "Training
+Results"). Videos and checkpoints land under
+`logs/rsl_rl/gear_assembly_ur10e/<timestamp>/`. For Flexiv Rizon 4s, swap
+`--task` to `GearInsertion-Rizon4s-Grav-ROSInference-v0`.
+
+### Monitoring with TensorBoard
+
+```bash
+python -m tensorboard.main --logdir logs/rsl_rl/gear_assembly_ur10e
+```
+
+Watch `Train/mean_reward` and `Episode_Termination/time_out` for an overall
+upward trend across iterations (per-iteration noise is normal).
+
+### Step 3: Play / Evaluate a Trained Checkpoint
+
+```bash
+python scripts/play.py \
+    --rl_library rsl_rl \
+    --task GearInsertion-UR10e-2F140-v0 \
+    --num_envs 16 \
+    --checkpoint logs/rsl_rl/gear_assembly_ur10e/<run>/model_<iter>.pt
+```
+
+This also exports the policy as `policy.pt` (TorchScript) and `policy.onnx` —
+see the next section,
+"[model.pt → policy.pt Export SOP](#modelpt--policypt-export-sop)", for the
+exact export location and full walkthrough. `policy.pt` is what the ROS2
+validation loop below consumes.
+
+### Step 4: ROS2 Simulated Validation / Real-Robot Deployment
+
+Either plug into the ROS2 validation loop (see
+"[ROS2 AI-Model Validation](#ros2-ai-model-validation-isaac-sim-as-the-simulated-robot)"
+below), or deploy straight to real hardware following the
+[Isaac ROS Manipulation DNN Policy documentation](https://nvidia-isaac-ros.github.io/reference_workflows/isaac_for_manipulation/packages/isaac_ros_manipulation_dnn_policy/index.html).
+The Isaac ROS inference pipeline consumes the `.pt` checkpoint + `agent.yaml` +
+`env.yaml` directly — no additional export step needed.
+
+## model.pt → policy.pt Export SOP
+
+The `model_<iter>.pt` files RSL-RL saves during training are **raw
+checkpoints** — the format `OnPolicyRunner.load()` reads to resume training or
+to rebuild the full actor/critic network inside `play.py`. They are **not**
+directly usable by a ROS2 inference node or any other deployment target.
+`scripts/play.py` automatically converts the checkpoint into two standalone,
+portable export formats the moment it loads it for playback:
+
+- **`policy.pt`** (TorchScript — readable via `torch.jit.load()`, and directly
+  by C++/LibTorch; this is the exact file this project's
+  `valid/ros2_validation_cpp/` ROS2 inference node consumes)
+- **`policy.onnx`** (ONNX, for other inference runtimes such as TensorRT)
+
+### Step 1: Find the Checkpoint to Convert
+
+```bash
+ls logs/rsl_rl/gear_assembly_ur10e/<run_timestamp>/model_*.pt
+```
+
+Training saves `model_<iteration>.pt` every `save_interval` iterations
+(default `50`, see "Configurable Training Parameters"; iterations are
+0-indexed). A full 800-iteration run's last checkpoint is typically
+`model_799.pt`.
+
+### Step 2: Run `play.py` to Trigger the Export
+
+```bash
+cd GearInsertionPolicy
+
+python scripts/play.py \
+    --rl_library rsl_rl \
+    --task GearInsertion-UR10e-2F140-v0 \
+    --num_envs 16 \
+    --checkpoint logs/rsl_rl/gear_assembly_ur10e/<run_timestamp>/model_799.pt
+```
+
+- `--task` should match the robot/gripper combination used at training time;
+  either the plain training task ID (no `-ROSInference` suffix) or the
+  ROSInference variant both work for playback — the only difference is
+  whether the reset pose is randomized.
+- `--checkpoint` accepts a full path, `latest` (auto-resolves the newest
+  checkpoint in the newest run), or `best`.
+- `--num_envs` only needs to be small here (this is just for visual
+  inspection, not training's 1024).
+- For Rizon 4s, swap `--task` to the matching `GearInsertion-Rizon4s-Grav-v0`.
+
+### Step 3: Confirm the Export (mind the output path — it's not next to the checkpoint!)
+
+```bash
+ls logs/rsl_rl/gear_assembly_ur10e/<run_timestamp>/exported/
+# policy.pt  policy.onnx
+```
+
+**The export lands in an `exported/` subdirectory inside the checkpoint's own
+folder**, i.e.:
+
+```
+logs/rsl_rl/gear_assembly_ur10e/<run_timestamp>/exported/policy.pt   ✓ correct
+logs/rsl_rl/gear_assembly_ur10e/<run_timestamp>/policy.pt            ✗ wrong — nothing is written here
+```
+
+Confirmed directly from
+`isaaclab_rl/entrypoints/backends/play_rsl_rl.py`'s source:
+
+```python
+export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+...
+export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+```
+
+### Step 4: Feed It Into ROS2 Validation (or Other Deployment)
+
+Pass the full `.../exported/policy.pt` path found in Step 3 to the ROS2
+inference node's `policy_path` parameter:
+
+```bash
+ros2 launch gear_insertion_ros2_cpp gear_insertion_validation_cpp.launch.py \
+    policy_path:=/absolute/path/logs/rsl_rl/gear_assembly_ur10e/<run_timestamp>/exported/policy.pt \
+    num_arm_joints:=6
+```
+
+See the "[ROS2 AI-Model Validation](#ros2-ai-model-validation-isaac-sim-as-the-simulated-robot)"
+section for the complete SOP. `policy_path` must be an **absolute path** —
+`ros2 launch`'s working directory isn't guaranteed to be
+`GearInsertionPolicy/`, so a relative path can easily fail to resolve.
+
+## Configurable Training Parameters
+
+`python scripts/train.py ...` has three layers of configurability, in priority
+order: **CLI args > `agents/rsl_rl_ppo_cfg.py` (RL hyperparameter defaults) >
+environment cfg files**.
+
+### A. Command-Line Arguments
+
+**Task / environment**
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--task` | str | none (required) | Gym task ID, see "Registered Gym Tasks" |
+| `--num_envs` | int | from cfg (1024 for this task) | Number of parallel environments |
+| `--seed` | int | from agent cfg | Random seed; `-1` auto-draws a random one |
+| `--device` | str | `cuda:0` | `cpu` / `cuda` / `cuda:N` |
+| `--distributed` | flag | `False` | Multi-GPU / multi-node training |
+
+**Display / recording**
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--visualizer` / `--viz` | str (CSV) | none (= headless) | `kit`/`rerun`/`newton_gl`/`viser`; **omitting it means headless** |
+| `--video` | flag | `False` | Periodically record video during training |
+| `--video_length` / `--video_interval` | int | from cfg | Clip length / interval (env steps) |
+
+**Training length / checkpoint**
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--max_iterations` | int | from agent cfg (1500 here) | Override total iterations |
+| `--checkpoint` | str | `None` | Resume training: path / `latest` / `best` |
+
+**Experiment logging**: `--experiment_name` / `--run_name` / `--logger`
+(`tensorboard`/`wandb`/`neptune`) / `--log_project_name`.
+
+> **There is no `--headless` flag** (confirmed by actually listing the flags
+> registered by `AppLauncher.add_app_launcher_args()` — it's not there). It's
+> now controlled entirely by `--visualizer`: omit it for headless, pass
+> `--visualizer kit` to open a window. The RSL-RL backend behind `train.py`/
+> `play.py` uses `parse_known_args`, so passing `--headless` there is silently
+> dropped (no error, but also no effect); `ros2_isaac_sim_bridge.py` uses a
+> strict `parse_args()`, so passing `--headless` there raises an
+> `unrecognized arguments` error outright.
+
+### B. RL Hyperparameters (`train/gear_insertion_policy/tasks/config/<robot>/agents/rsl_rl_ppo_cfg.py`)
+
+No CLI override exists for these — edit the file directly:
+
+| Field | Current value | Description |
+|---|---|---|
+| `num_steps_per_env` | `512` | Rollout steps collected per env before each PPO update |
+| `max_iterations` | `1500` | Default total training iterations |
+| `save_interval` | `50` | Checkpoint save frequency (iterations) |
+| `clip_actions` | `1.0` | Action clipping range |
+| `rnn_type` / `rnn_hidden_dim` / `rnn_num_layers` | `lstm` / `256` / `2` | Actor/Critic LSTM configuration |
+| `hidden_dims` | `[256, 128, 64]` | MLP head after the LSTM |
+| `learning_rate` / `schedule` / `desired_kl` | `5e-4` / `adaptive` / `0.008` | Learning rate and its auto-adjustment |
+| `clip_param` / `entropy_coef` | `0.2` / `0.0` | PPO clip range / entropy bonus coefficient |
+| `num_learning_epochs` / `num_mini_batches` | `8` / `16` | How each rollout batch is split for training |
+| `gamma` / `lam` | `0.99` / `0.95` | Discount factor / GAE λ |
+
+Full field list:
+`python -c "import dataclasses; from isaaclab_rl.rsl_rl import RslRlPpoAlgorithmCfg as C; [print(f.name) for f in dataclasses.fields(C)]"`
+
+### C. Environment-Level Parameters (`gear_assembly_env_cfg.py` / `config/<robot>/joint_pos_env_cfg.py`)
+
+| Parameter | Current value | Description |
+|---|---|---|
+| `scene.num_envs` | `1024` | Default parallel environment count |
+| `episode_length_s` | `6.66` | Episode length in seconds |
+| `decimation` / `sim.dt` | `4` / `1/120` | Physics substeps per control step / physics step size |
+| `joint_action_scale` | `0.025` | Network output × this value = joint-angle delta (radians) |
+| `solver_position_iteration_count` | `4` | Contact solver iteration count |
+| `gpu_collision_stack_size` etc. | `2**30` etc. | PhysX GPU buffer sizes |
+
+## The Three Sim-to-Real Consistency Principles
+
+| Principle | Meaning | Corresponding Code |
+|---|---|---|
+| **Input Consistency** | Observations the policy sees in sim must match what real sensors can provide, with matching noise | `joint_pos`/`joint_vel` noise-free; `gear_shaft_pos`/`gear_shaft_quat` carry a noise model (emulating FoundationPose + RealSense error) |
+| **System Response Consistency** | The simulated robot/environment must respond to actions the way the real system does | Friction materials, PD-gain randomization, joint friction, contact solver iteration count |
+| **Output Consistency** | Any post-processing Isaac Lab applies to policy outputs must also be applied at real-robot inference | `RelativeJointPositionActionCfg(scale=..., use_zero_offset=True)` — the real-robot side must apply the same `action_scale` |
+
+**Debugging tip**: when the real robot fails, first make its initial
+observations match the simulation's, then compare controller/system response —
+this isolates whether the issue is "observation mismatch" or
+"physics/controller mismatch."
+
+## Code Architecture
+
+### `train/gear_insertion_policy/tasks/gear_assembly_env_cfg.py` (robot-agnostic shared base)
+
+- **`GearAssemblySceneCfg`**: ground plane, `factory_gear_base` (the gear base,
+  `kinematic_enabled=True`), `factory_gear_{small,medium,large}` (three
+  movable gear sizes), `robot: ArticulationCfg = MISSING` (filled in by each
+  robot's config — the **ROBOT SWAP POINT**), lighting, stand.
+- **`ActionsCfg`**: `arm_action` (filled with `RelativeJointPositionActionCfg`
+  by each robot), `gripper_action` (the gear is already grasped at episode
+  start; not actively controlled during training, usually `None`).
+- **`ObservationsCfg`**: `PolicyCfg` (what a real robot could provide, with
+  noise: `joint_pos`/`joint_vel`/`gear_shaft_pos`/`gear_shaft_quat`),
+  `CriticCfg` (also includes noise-free privileged info like `gear_pos`/
+  `gear_quat`, critic-only, speeds up training convergence).
+- **`RewardsCfg`**: `keypoint_entity_error` (`-1.5`, gear-to-base keypoint
+  distance penalty), `keypoint_entity_error_exp` (`+1.5`, exponential
+  fine-alignment reward), `action_rate_l2` (`-5e-6`, action smoothness).
+- **`TerminationsCfg`**: `time_out`; `gear_dropped` (end-effector-to-gear
+  distance > 15cm); `gear_orientation_exceeded` (pose deviation past an angle
+  threshold).
+
+### `train/gear_insertion_policy/tasks/mdp/` (task-specific MDP library)
+
+| File | Content |
+|---|---|
+| `observations.py` | `gear_shaft_pos_w`/`gear_shaft_quat_w` (shaft world pose), `gear_pos_w`/`gear_quat_w` (gear's own pose, critic-only) |
+| `rewards.py` | `keypoint_entity_error(_exp)` (keypoint distance — captures both translation and rotation error better than raw pose error), `keypoint_ee_grasp_error(_exp)` (end-effector vs. correct grasp pose, Rizon 4s only) |
+| `terminations.py` | `reset_when_gear_dropped`, `reset_when_gear_orientation_exceeds_threshold` |
+| `events.py` | `randomize_gear_type` (picks a gear size per reset, tracked on `env._gear_type_manager`), `randomize_gears_and_base_pose`, `set_robot_to_grasp_pose` (differential IK to a pre-grasped pose); depends on `isaaclab_tasks.contrib.automate.factory_control` (a generic IsaacLab utility, not copied into this project) |
+| `noise_models.py` | `ResetSampledConstantNoiseModel(Cfg)` (draws one fixed noise value per episode), `ResetSampledQuaternionNoiseModel(Cfg)` |
+
+### `config/ur_10e/` vs. `config/rizon_4s/`
+
+| | UR10e (6 DOF) | Rizon 4s (7 DOF) + Grav |
+|---|---|---|
+| End-effector body | `wrist_3_link` | `link7` |
+| `joint_action_scale` | `0.025` | `0.025` |
+| Observation noise | `gear_shaft_pos` ±5mm | `gear_shaft_pos` ±10mm + `gear_shaft_quat` ±2° (larger perception-pipeline noise) |
+| Extra `EventCfg`: `robot_joint_stiffness_and_damping`/`joint_friction` | Yes (emulates real-robot stiction, PD-gain randomization) | No (the real controller is accurate enough without it) |
+| Extra `RewardsCfg`: `end_effector_grasp_keypoint_tracking(_exp)` | No | Yes (`weight_ramp_steps=512_000` linearly ramps the weight in, avoiding over-penalizing before coarse insertion is learned) |
+| `config/<robot>/ros_inference_env_cfg.py` | Inherits the training config, fixes reset poses + exposes ROS metadata (`obs_order`/`action_space`/`fixed_asset_init_pos_center`, etc.) | Same |
+
+### `config/<robot>/agents/rsl_rl_ppo_cfg.py`
+
+Both robots share an RNN(LSTM)+PPO architecture:
+`HeteroscedasticGaussianDistributionCfg(std_type="log")` makes the action
+standard deviation learnable; RNN instead of a plain MLP because the policy
+needs to temporally filter noisy observations and contact state.
+
+## Registered Gym Tasks
+
+| Gym Task ID | Robot | Gripper | Purpose |
+|---|---|---|---|
+| `GearInsertion-UR10e-2F140-v0` | UR10e (6DOF) | Robotiq 2F-140 | Training (randomized resets) |
+| `GearInsertion-UR10e-2F85-v0` | UR10e (6DOF) | Robotiq 2F-85 | Training (randomized resets) |
+| `GearInsertion-UR10e-2F140-ROSInference-v0` | UR10e (6DOF) | Robotiq 2F-140 | Fixed resets + ROS metadata |
+| `GearInsertion-UR10e-2F85-ROSInference-v0` | UR10e (6DOF) | Robotiq 2F-85 | Fixed resets + ROS metadata |
+| `GearInsertion-Rizon4s-Grav-v0` | Flexiv Rizon 4s (7DOF) | Grav gripper | Training (randomized resets) |
+| `GearInsertion-Rizon4s-Grav-ROSInference-v0` | Flexiv Rizon 4s (7DOF) | Grav gripper | Fixed resets + ROS metadata |
+
+These IDs are deliberately different from the upstream
+`IsaacContrib-Deploy-GearAssembly-*` ones, so they can coexist with an
+installed IsaacLab's built-in tasks without colliding.
+
+## ROS2 AI-Model Validation (Isaac Sim as the Simulated Robot)
+
+Once training is done and `play.py` has exported `policy.pt`, there's one more
+gap to close before real hardware: **verifying `policy.pt` still works when
+observations/actions actually travel over ROS2** (cross-process, message
+(de)serialization, RNN hidden-state management, action post-processing —
+none of which `play.py`'s same-process calls would ever catch). This project
+uses **Isaac Sim as the simulated robot**, paired with a real **C++ ROS2
+node** running AI inference, to form a complete ROS2 closed loop.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────┐   /gear_insertion/joint_states (sensor_msgs/JointState)
+│  scripts/                   │   /gear_insertion/gear_shaft_pose (geometry_msgs/PoseStamped)
+│  ros2_isaac_sim_bridge.py   │ ──────────────────────────────────────────────────┐
+│  (run with python, needs    │                                                    │
+│   Kit/GPU)                  │ <─────────────────────────────────────────────┐  │
+│  = robot + perception (sim) │   /gear_insertion/policy_action (Float32MultiArray) │
+└─────────────────────────────┘                                                 │  │
+         │ /gear_insertion/episode_event (JSON)                                   │  │
+         v                                                                         │  │
+┌─────────────────────────────┐                   ┌─────────────────────────────┐ │  │
+│ valid/ros2_validation_cpp/   │                   │ valid/ros2_validation_cpp/   │ │  │
+│ success_monitor_node         │                   │ policy_inference_node        │─┘  │
+│ = automated pass/fail tally  │                   │ = AI model (torch::jit::load)│────┘
+└─────────────────────────────┘                   └─────────────────────────────┘
+```
+
+The robot side (`scripts/ros2_isaac_sim_bridge.py`) needs Kit/GPU and must be
+launched directly with `python`; the AI-model and validation sides
+(`valid/ros2_validation_cpp/`) are pure rclcpp + LibTorch, launched via
+`ros2 run`/`ros2 launch`, and can run on a different machine entirely.
+
+### Prerequisites
+
+```bash
+source /opt/ros/<distro>/setup.bash
+
+cd GearInsertionPolicy/valid/ros2_validation_cpp
+colcon build --cmake-args -DCMAKE_PREFIX_PATH=/path/to/libtorch
+source install/setup.bash
+export LD_LIBRARY_PATH=/path/to/libtorch/lib:$LD_LIBRARY_PATH   # also needed at runtime
+```
+
+Whether the `isaacsim.ros2.bridge` extension enables cleanly on your specific
+ROS2 distro needs an actual GPU/Kit environment to confirm; everything else
+(colcon build, node startup, end-to-end message flow) has already been tested
+on a local ROS2 Jazzy + LibTorch setup — see "Known Limitations & Verification
+Log".
+
+### SOP: Running a Full ROS2 AI-Model Validation Pass
+
+**Terminal 1 (robot side = Isaac Sim, must use python):**
+
+```bash
+source /opt/ros/<distro>/setup.bash   # so rclpy is importable inside the Isaac Sim process
+cd GearInsertionPolicy
+
+python scripts/ros2_isaac_sim_bridge.py \
+    --task GearInsertion-UR10e-2F140-ROSInference-v0 \
+    --num_episodes 50 \
+    --insertion_distance_threshold 0.01
+```
+
+Omitting `--visualizer` means headless; add `--visualizer kit` to see the
+window.
+
+**Terminal 2 (AI-model + validation side):**
+
+```bash
+source /opt/ros/<distro>/setup.bash
+source GearInsertionPolicy/valid/ros2_validation_cpp/install/setup.bash
+
+ros2 launch gear_insertion_ros2_cpp gear_insertion_validation_cpp.launch.py \
+    policy_path:=/path/to/logs/rsl_rl/gear_assembly_ur10e/<run>/exported/policy.pt \
+    num_arm_joints:=6 \
+    report_path:=/tmp/gear_insertion_validation_report.json
+```
+
+`policy.pt` is the TorchScript file `scripts/play.py` exported (see
+"[model.pt → policy.pt Export SOP](#modelpt--policypt-export-sop)" for the
+exact export location and the full walkthrough). Terminal 2 continuously
+prints `episodes=.. success=.. (xx.x%) failures={...}`, and
+`report_path` is a continuously-updated JSON success-rate report. For Rizon
+4s, swap `--task`/`num_arm_joints` to the matching values.
+
+### Quick Inspection Tools
+
+```bash
+ros2 topic list                                   # should show 4 /gear_insertion/* topics
+ros2 topic hz /gear_insertion/joint_states        # confirm publish rate
+ros2 topic echo /gear_insertion/episode_event     # watch per-episode end events (JSON)
+```
+
+### Topic / Message Format Table
+
+| Topic (`<ns>` defaults to `gear_insertion`) | Message Type | Publisher | Content |
+|---|---|---|---|
+| `/<ns>/joint_states` | `sensor_msgs/JointState` | Isaac Sim bridge | Joint position/velocity, **noise-free** |
+| `/<ns>/gear_shaft_pose` | `geometry_msgs/PoseStamped` | Isaac Sim bridge | Gear-shaft world pose, **carries the same noise model used at training time** |
+| `/<ns>/policy_action` | `std_msgs/Float32MultiArray` | AI inference node | Raw policy action, clamped to `[-1, 1]`, length = `num_arm_joints` |
+| `/<ns>/episode_event` | `std_msgs/String` (JSON) | Isaac Sim bridge | `{"event":"episode_end","episode_index":N,"outcome":"success"/"failure","reason":"time_out"/"time_out_not_inserted"/"gear_dropped"/"gear_orientation_exceeded","final_distance_m":0.00xxx}` |
+
+### Code Walkthrough
+
+**`scripts/ros2_isaac_sim_bridge.py` (robot side)**
+
+- Same opening pattern as `train.py`/`play.py`: `argparse` for custom args +
+  `AppLauncher.add_app_launcher_args(parser)`. After `AppLauncher(args_cli)`
+  boots Kit, it enables the ROS2 bridge extension via
+  `omni.kit.app.get_app().get_extension_manager().set_extension_enabled_immediate("isaacsim.ros2.bridge", True)`
+  (deliberately *not* via an isaacsim convenience wrapper like
+  `isaacsim.core.utils.extensions.enable_extension` — testing showed that
+  wrapper's module path moves between Isaac Sim releases; `omni.kit.app` is
+  the stable layer both wrappers call into underneath), then `import rclpy`.
+- `IsaacSimRobotBridgeNode.__init__`: uses
+  `isaaclab_tasks.utils.parse_env_cfg(task_id, device=..., num_envs=1)` to
+  build the env cfg, then `gym.make(task_id, cfg=env_cfg)` — the standard
+  Isaac Lab environment-construction pattern (`gym.make(task_id, num_envs=1)`
+  alone does not work).
+- `_publish_observations`: slices `self._obs["policy"][0]` directly (the exact
+  same, noise-included observation tensor used at training time) in
+  `[joint_pos(n), joint_vel(n), gear_shaft_pos(3), gear_shaft_quat(4)]` order.
+  **Quaternion component order is `(x, y, z, w)`** (Isaac Lab 3.0's
+  `QUAT_XYZW_ELEMENT_NAMES` convention — conveniently the same order as
+  `geometry_msgs/Quaternion`, so no reordering needed; `gear_shaft_quat_w()`'s
+  docstring saying `(w,x,y,z)` is a stale leftover from older Isaac Lab
+  releases).
+- `_publish_episode_end`: **success is not judged by time_out alone**.
+  `time_out` is a necessary but not sufficient condition — `_obs_term_slice()`
+  (computes offsets dynamically from `ObservationManager.active_terms`/
+  `group_obs_term_dim`, since the critic group's `joint_pos`/`joint_vel`
+  dimension depends on the robot/gripper and can't be hardcoded) extracts the
+  noise-free `gear_pos` (actual gear position) and `gear_shaft_pos` (target)
+  from the `critic` observation group, computes the real distance, and only
+  calls it `success` if that distance is below `--insertion_distance_threshold`
+  (default 1cm); reaching time_out without actually being inserted is labeled
+  `time_out_not_inserted`. `episode_event` carries the actual
+  `final_distance_m` value.
+- `step_once`: if no fresh `/policy_action` has arrived for
+  `--hold_last_action_steps` steps (inference node not up yet, or stalled),
+  falls back to an all-zero action (hold position) rather than applying a
+  stale command.
+
+**`valid/ros2_validation_cpp/src/policy_inference_node.cpp` (AI-model side)**
+
+- `torch::jit::load(policy_path, device)` loads the TorchScript file exported
+  by `play.py`, matching the interface of
+  `isaaclab_rl/rsl_rl/exporter.py`'s `_TorchPolicyExporter`:
+  `policy_.forward({obs_tensor}).toTensor()` returns the actor's
+  (deterministic) mean action, **not automatically clamped** — RSL-RL's
+  `clip_actions=1.0` happens inside the training environment, not inside the
+  exported TorchScript module, so `torch::clamp(raw_action, -1.0, 1.0)` is
+  applied explicitly here.
+- `policy_.get_method("reset")({})`: clears the LSTM hidden state on
+  `episode_end` events (mirrors `exporter.py`'s `reset_memory()`), preventing
+  a new episode from starting with the previous episode's memory.
+- `tiny_json.hpp`: deliberately not a general JSON library — a minimal string
+  extractor that only understands this project's own fixed
+  `{"key": "value", ...}` format, since both the producer and consumer are
+  controlled by this project and the format never needs to be generic.
+
+**`valid/ros2_validation_cpp/src/success_monitor_node.cpp` (automated validation)**
+
+A plain `episode_event` counter: accumulates `total`/`success`, buckets
+failures by reason (`gear_dropped`/`gear_orientation_exceeded`/
+`time_out_not_inserted`), logs a summary every `report_every_n` episodes, and
+continuously overwrites a JSON report if `report_path` is given.
+
+### What This Validates, and What It Doesn't
+
+**Validates**: whether the exported `policy.pt` still behaves correctly across
+process boundaries, real ROS2 message (de)serialization, noisy observations,
+correct RNN hidden-state resets, and correctly-reproduced action clamping —
+plus the **real insertion success rate** when Isaac Sim's physics stands in
+for the robot (judged by a real gear-to-shaft distance threshold, not merely
+"ran out the clock").
+
+**Does not validate**: real sensor noise characteristics (this is still a
+simulated noise model, not actual FoundationPose output), real robot
+controller dynamics (stiction, communication latency), or real cuMotion
+motion planning. Those still require wiring up the full
+[Isaac ROS Manipulation DNN Policy pipeline](https://nvidia-isaac-ros.github.io/reference_workflows/isaac_for_manipulation/packages/isaac_ros_manipulation_dnn_policy/index.html)
+per "Step 4: Real-Robot Deployment" above.
+
+## Swapping the Robot Arm
+
+To add a new arm (e.g. Franka Panda), copy the structure of
+`train/gear_insertion_policy/tasks/config/ur_10e/`:
+
+1. **Create a new folder** `train/gear_insertion_policy/tasks/config/<your_robot>/`,
+   copying every file under `ur_10e/` as a template.
+2. **Swap the `ArticulationCfg`** (the line marked `# --- ROBOT SWAP POINT` in
+   `joint_pos_env_cfg.py`): point it at your arm's config (one already in
+   `isaaclab_assets`, or your own).
+3. **Update the robot-specific scalars** (inside
+   `<Robot>GearAssemblyEnvCfg.__post_init__`):
+   - `self.end_effector_body_name`: the end-effector body name
+   - `self.num_arm_joints`: arm DOF count (excluding the gripper)
+   - `self.grasp_rot_offset`: grasp-pose quaternion offset (work this out with
+     differential IK, or iterate with `--visualizer kit` and a small `num_envs`)
+   - `self.observations.policy.joint_pos/joint_vel.params["asset_cfg"].joint_names`
+   - `self.actions.arm_action = mdp.RelativeJointPositionActionCfg(...)`
+4. **Gripper actuator + joint setter**:
+   - `self.scene.robot.actuators["gripper_..."] = ImplicitActuatorCfg(...)`
+   - Write a `set_finger_joint_pos_<your_gripper>(...)` function (see
+     `set_finger_joint_pos_robotiq_2f140`/`set_finger_joint_pos_grav` for
+     reference)
+   - `self.gear_offsets_grasp` / `self.hand_grasp_width` / `self.hand_close_width`
+5. **Physics/action tuning** (per the "System Response Consistency" principle,
+   iterate against real-robot video): `solver_position_iteration_count`; add
+   `robot_joint_stiffness_and_damping`/`joint_friction` if there's noticeable
+   stiction (like UR10e); `joint_action_scale` needs a real-robot step-response
+   measurement to confirm it's large enough to overcome friction.
+6. **Register the Gym task**: call
+   `gym.register(id="GearInsertion-<YourRobot>-v0", ...)` in
+   `config/<your_robot>/__init__.py`, and add the new sub-package to
+   `tasks/__init__.py`'s `from .config import ...`.
+7. **RSL-RL agent config**: usually just reuse the existing RNN+PPO
+   architecture, only changing `experiment_name`.
+8. Sanity-check with
+   `python scripts/train.py --task GearInsertion-<YourRobot>-v0 --num_envs 4 --visualizer kit`
+   before moving to full-scale training.
+
+## Swapping the Manipulated Object
+
+To replace "gear insertion" with a different insertion/assembly task, follow
+this checklist against `train/gear_insertion_policy/tasks/gear_assembly_env_cfg.py`
+(marked `# --- OBJECT SWAP POINT`) and its dependents:
+
+1. **Scene assets**: replace the 4 `RigidObjectCfg` entries
+   (`factory_gear_base`/`factory_gear_{small,medium,large}`) with your own USD
+   assets (keep the base part `kinematic_enabled=True`).
+2. **Offset constants**: `self.gear_offsets` (the sub-part's key insertion
+   point, relative to the base part's reference point).
+3. **`mdp/events.py`**: `randomize_gear_type` (swap the `gear_types` list),
+   `randomize_gears_and_base_pose` (pose randomization ranges),
+   `set_robot_to_grasp_pose` (needs rework if the grasp method differs, e.g. a
+   suction cup instead of a gripper).
+4. **`mdp/observations.py`**: `gear_shaft_pos_w`/`gear_quat_w` etc. currently
+   hardcode the `factory_gear_*` scene-entity names — update these along with
+   the swap.
+5. **`mdp/rewards.py`/`mdp/terminations.py`**: the logic itself is generic, but
+   `keypoint_scale`/`distance_threshold`/angle-tolerance thresholds need
+   re-tuning for the new object's scale.
+6. **`config/<robot>/joint_pos_env_cfg.py`**: `gear_offsets_grasp`/
+   `hand_grasp_width`/`hand_close_width` need to be re-measured.
+7. **Physics materials**: every `*_physics_material` in `EventCfg` needs
+   friction coefficients matching the new object (record real-robot video,
+   compare visually in sim — no need to wait for a full training run).
+8. **`scripts/ros2_isaac_sim_bridge.py`'s `_publish_episode_end`**: if the
+   base/sub-part scene-entity names changed, update the `gear_pos`/
+   `gear_shaft_pos` term names `_obs_term_slice` looks up too.
+
+## Troubleshooting
+
+### PhysX Collision Stack Overflow
+
+```
+PhysX error: PxGpuDynamicsMemoryConfig::collisionStackSize buffer overflow detected,
+please increase its size to at least 269452544 in the scene desc!
+```
+
+Increase this in `gear_assembly_env_cfg.py`'s
+`GearAssemblyEnvCfg.sim.physics` (`PhysxCfg`):
+
+```python
+sim: SimulationCfg = SimulationCfg(
+    physics=PhysxCfg(
+        gpu_collision_stack_size=2**31,
+        gpu_max_rigid_contact_count=2**23,
+        gpu_max_rigid_patch_count=2**23,
+    ),
+)
+```
+
+### CUDA Out of Memory
+
+In order of preference: ① lower `--num_envs` (256→128→64…); ② if you raised
+`solver_position_iteration_count`, set it back to the default `4`; ③ drop
+`--video`.
+
+### `isaacsim.core.utils` ImportError
+
+```
+ModuleNotFoundError: No module named 'isaacsim.core.utils'
+```
+
+Some Isaac Sim builds moved this convenience wrapper under `extsDeprecated/`.
+This project's `ros2_isaac_sim_bridge.py` already uses the version-stable
+`omni.kit.app` API instead (see "Code Walkthrough" above) and won't hit this;
+if you hit a similar error elsewhere, switch to
+`omni.kit.app.get_app().get_extension_manager()` there too.
+
+## Known Limitations & Verification Log
+
+This project's core code (`train/gear_insertion_policy/`,
+`scripts/ros2_isaac_sim_bridge.py`, `valid/ros2_validation_cpp/`) has been
+exercised on real hardware, not just statically checked:
+
+- **Environment definitions**: all 6 Gym tasks and both RSL-RL agent configs
+  were statically built (imported + instantiated every cfg class) under an
+  IsaacLab venv, and a full UR10e training run (800 iterations, see "Training
+  Results") completed on real GPU hardware (RTX 5070 Ti); Isaac Lab's own
+  printed Observation/Action/Termination/Reward Manager tables matched the
+  design exactly.
+- **ROS2 validation loop**: `valid/ros2_validation_cpp/` builds cleanly with
+  `colcon build` against a local ROS2 Jazzy + LibTorch setup, and was
+  end-to-end tested with a dummy TorchScript policy (message flow and
+  `reset()` calls both verified); `scripts/ros2_isaac_sim_bridge.py` was run
+  for real on the user's own GPU for 50 episodes, and once
+  `policy_inference_node` was wired to a real checkpoint, `episode_event`
+  correctly reported all three outcomes (`success`/`gear_dropped`/
+  `gear_orientation_exceeded`).
+- **Known limitations**: the success criterion uses straight-line
+  gear-to-shaft distance rather than the full keypoint method, so it doesn't
+  account for insertion angle; the `isaacsim.ros2.bridge` extension's
+  compatibility across different ROS2 distros, and wiring up the full Isaac
+  ROS pipeline with real FoundationPose/cuMotion, still need to be verified by
+  you per "Step 4: Real-Robot Deployment."
+
+## References
+
+- [Isaac Lab official tutorial: Training a Gear Insertion Policy and ROS Deployment](https://isaac-sim.github.io/IsaacLab/release/3.0.0/source/policy_deployment/02_gear_assembly/gear_assembly_policy.html)
+- [Isaac ROS Manipulation DNN Policy (real-robot deployment pipeline)](https://nvidia-isaac-ros.github.io/reference_workflows/isaac_for_manipulation/packages/isaac_ros_manipulation_dnn_policy/index.html)
+- RSL-RL TorchScript export interface: `isaaclab_rl/isaaclab_rl/rsl_rl/exporter.py` (IsaacLab source)

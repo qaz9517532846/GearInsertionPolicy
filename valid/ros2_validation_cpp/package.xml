@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>gear_insertion_ros2_cpp</name>
+  <version>0.1.0</version>
+  <description>
+    C++ (rclcpp + LibTorch) equivalent of the gear_insertion_ros2 Python package:
+    a TorchScript policy inference node and a success-rate monitor, for AI-model
+    validation against the Isaac-Sim-simulated "robot"
+    (GearInsertionPolicy/scripts/ros2_isaac_sim_bridge.py). Same ROS2 topic
+    contract as the Python nodes -- see the project README.md.
+  </description>
+  <maintainer email="qaz9517532846@gmail.com">GearInsertionPolicy maintainer</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <!-- LibTorch itself is found via CMAKE_PREFIX_PATH, not a rosdep key
+       (there is no official ROS package for it); see CMakeLists.txt. -->
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
